@@ -4,12 +4,13 @@ import os
 import random
 import sqlite3
 from itertools import islice
-
 import aiohttp
 import pymorphy2
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from dotenv import load_dotenv
 
 # Загрузка переменных окружения из файла .env
@@ -25,15 +26,130 @@ OZON_API_URL: str = "https://api-seller.ozon.ru"
 OZON_TOKEN: str = os.getenv("OZON_TOKEN", "")
 CLIENT_ID: str = os.getenv("CLIENT_ID", "")
 CHECK_INTERVAL: int = int(os.getenv("CHECK_INTERVAL", 300))
-
-# Проверяем перед запуском, что все токены заданы
-if not all([TELEGRAM_BOT_TOKEN, NOTIFICATION_CHANNEL_ID, OZON_TOKEN, CLIENT_ID]):
-    raise ValueError("Пожалуйста, задайте TELEGRAM_BOT_TOKEN, NOTIFICATION_CHANNEL_ID, OZON_TOKEN и CLIENT_ID!")
+MAX_USERS: int = 5  # Максимальное количество пользователей
 
 # Инициализация бота и диспетчера
 bot: Bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp: Dispatcher = Dispatcher()
 router: Router = Router()  # Создаем маршрутизатор
+
+# Состояния для FSM
+class UserStates(StatesGroup):
+    waiting_for_start = State()
+
+
+def init_db() -> None:
+    """Инициализация базы данных и создание таблиц."""
+    conn = sqlite3.connect("ozon_reviews.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS processed_reviews (
+            review_id TEXT PRIMARY KEY,
+            sku TEXT,
+            product_name TEXT,
+            user_name TEXT,
+            review_text TEXT,
+            rating INTEGER,
+            response_text TEXT,
+            comment_id TEXT,
+            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            is_active INTEGER DEFAULT 1
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def save_review_to_db(review_id: str, sku: str, product_name: str, user_name: str, review_text: str, rating: int, response_text: str, comment_id: str) -> None:
+    """Сохранить обработанный отзыв в базу данных."""
+    conn = sqlite3.connect("ozon_reviews.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO processed_reviews (review_id, sku, product_name, user_name, review_text, rating, response_text, comment_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (review_id, sku, product_name, user_name, review_text, rating, response_text, comment_id))
+    conn.commit()
+    conn.close()
+
+
+def is_review_processed(review_id: str) -> bool:
+    """Проверить, обработан ли отзыв ранее."""
+    conn = sqlite3.connect("ozon_reviews.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM processed_reviews WHERE review_id = ?", (review_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
+
+
+def add_user(user_id: int, username: str) -> bool:
+    """Добавить пользователя в базу данных."""
+    conn = sqlite3.connect("ozon_reviews.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM users WHERE is_active = 1")
+    active_users = cursor.fetchone()[0]
+    if active_users >= MAX_USERS:
+        conn.close()
+        return False
+    cursor.execute("""
+        INSERT OR IGNORE INTO users (user_id, username, is_active)
+        VALUES (?, ?, 1)
+    """, (user_id, username))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def get_active_users() -> list:
+    """Получить список активных пользователей."""
+    conn = sqlite3.connect("ozon_reviews.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users WHERE is_active = 1")
+    users = cursor.fetchall()
+    conn.close()
+    return [user[0] for user in users]
+
+
+async def notify_users(message: str) -> None:
+    """Отправить уведомление всем активным пользователям."""
+    active_users = get_active_users()
+    for user_id in active_users:
+        try:
+            await bot.send_message(user_id, message, parse_mode="HTML")
+            logging.info(f"Уведомление отправлено пользователю {user_id}")
+        except Exception as e:
+            logging.error(f"Ошибка отправки уведомления пользователю {user_id}: {e}")
+
+
+@router.message(Command(commands=["start", "help"]))
+async def send_welcome(message: Message, state: FSMContext) -> None:
+    """Обработчик команды /start и /help."""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Start", callback_data="start_bot")]
+    ])
+    await message.answer("Привет! Нажмите кнопку Start, чтобы активировать бот и получать уведомления.", reply_markup=keyboard)
+    await state.set_state(UserStates.waiting_for_start)
+
+
+
+@router.callback_query(UserStates.waiting_for_start)
+async def handle_start_button(callback: CallbackQuery, state: FSMContext) -> None:
+    """Обработка нажатия кнопки Start."""
+    user_id = callback.from_user.id
+    username = callback.from_user.username or str(user_id)
+
+    if add_user(user_id, username):
+        await callback.message.answer("✅ Вы успешно активировали бота! Теперь вы будете получать уведомления о новых отзывах.")
+    else:
+        await callback.message.answer("❌ Извините, достигнуто максимальное количество пользователей (5).")
+
+    await state.clear()
 
 
 async def get_product_info_from_card(sku: int, session: aiohttp.ClientSession) -> dict:
@@ -88,6 +204,7 @@ async def get_product_name_and_brand_by_sku(sku: int, session: aiohttp.ClientSes
 
     return product_name, brand_name
 
+
 def get_brand_name(brand: str) -> str:
     """Извлекает название бренда из строки."""
     brand = brand.strip().lower()
@@ -112,48 +229,6 @@ def get_brand_name(brand: str) -> str:
 
     return "Guten Morgen"
 
-def init_db() -> None:
-    """Инициализация базы данных и создание таблиц."""
-    if os.path.exists("ozon_reviews.db"):
-        os.remove("ozon_reviews.db")
-
-    conn = sqlite3.connect("ozon_reviews.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS processed_reviews (
-            review_id TEXT PRIMARY KEY,
-            sku TEXT,
-            product_name TEXT,
-            user_name TEXT,
-            review_text TEXT,
-            rating INTEGER,
-            response_text TEXT,
-            comment_id TEXT,
-            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-def save_review_to_db(review_id: str, sku: str, product_name: str, user_name: str, review_text: str, rating: int, response_text: str, comment_id: str) -> None:
-    """Сохранить обработанный отзыв в базу данных."""
-    conn = sqlite3.connect("ozon_reviews.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO processed_reviews (review_id, sku, product_name, user_name, review_text, rating, response_text, comment_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (review_id, sku, product_name, user_name, review_text, rating, response_text, comment_id))
-    conn.commit()
-    conn.close()
-
-def is_review_processed(review_id: str) -> bool:
-    """Проверить, обработан ли отзыв ранее."""
-    conn = sqlite3.connect("ozon_reviews.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM processed_reviews WHERE review_id = ?", (review_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
 
 async def get_unprocessed_reviews(session: aiohttp.ClientSession) -> list:
     url = f"{OZON_API_URL}/v1/review/list"
@@ -178,6 +253,7 @@ async def get_unprocessed_reviews(session: aiohttp.ClientSession) -> list:
         logging.error(f"Ошибка сети при запросе API: {e}")
         return []
 
+
 async def post_comment(review_id: str, text: str, session: aiohttp.ClientSession) -> str:
     """Отправить комментарий на отзыв через Ozon API."""
     url = f"{OZON_API_URL}/v1/review/comment/create"
@@ -192,12 +268,18 @@ async def post_comment(review_id: str, text: str, session: aiohttp.ClientSession
         async with session.post(url, json=payload, headers=headers) as response:
             result = await response.json()
             if response.status == 200:
-                return result.get("comment_id", "")
+                comment_id = result.get("comment_id", "")
+                if comment_id:
+                    logging.info(f"Комментарий успешно отправлен на отзыв ID: {review_id}, comment_id: {comment_id}")
+                else:
+                    logging.warning(f"Комментарий отправлен, но comment_id не получен для отзыва ID: {review_id}")
+                return comment_id
             else:
                 logging.error(f"Ошибка при отправке комментария: {result}")
     except aiohttp.ClientError as e:
         logging.error(f"Ошибка сети при отправке комментария: {e}")
     return ""
+
 
 async def notify_channel(sku: int, response_text: str, rating: int, product_name: str, user_name: str, review_text: str) -> None:
     """Отправить уведомление в канал о новом комментарии."""
@@ -242,56 +324,122 @@ async def notify_channel(sku: int, response_text: str, rating: int, product_name
     except Exception as e:
         logging.error(f"Ошибка отправки сообщения в Telegram: {e}")
 
+
 def generate_response(rating: int, brand_name: str, product_name: str) -> str:
-    """Генерация шаблонного ответа."""
+    """Генерация шаблонного ответа, включая исправление склонений для рейтинга 1 звезда."""
     morph = pymorphy2.MorphAnalyzer()
 
-    first_word = product_name.split()[0] if product_name else "продукт"
+    # Извлекаем первое ключевое слово из названия товара
+    first_word = product_name.split()[0].lower() if product_name else "продукт"
     first_word_parsed = morph.parse(first_word)[0]
-    first_word_genitive = first_word_parsed.inflect({'gent'}).word if first_word_parsed.inflect({'gent'}) else "продукции"
 
-    our_word_parsed = morph.parse("нашей")[0]
-    gender = first_word_parsed.tag.gender if first_word_parsed.tag.gender else 'neut'
-    our_word_genitive = our_word_parsed.inflect({gender}).word if our_word_parsed.inflect({gender}) else "нашей"
+    # Попытка склонения в родительном падеже
+    try:
+        first_word_genitive = first_word_parsed.inflect({'gent'}).word if first_word_parsed.inflect({'gent'}) else first_word
+    except:
+        first_word_genitive = first_word  # Значение по умолчанию
 
+    # Определяем род и согласуем грамматику (нашего/нашей/наших)
+    try:
+        gender = first_word_parsed.tag.gender
+        number = first_word_parsed.tag.number  # Единственное или множественное число
+
+        if number == 'plur':  # Множественное число
+            our_word = "наших"
+        elif gender == 'masc':  # Мужской род
+            our_word = "нашего"
+        elif gender == 'femn':  # Женский род
+            our_word = "нашей"
+        elif gender == 'neut':  # Средний род
+            our_word = "нашего"
+        else:
+            our_word = "нашей"  # Значение по умолчанию
+    except:
+        our_word = "нашей"  # Значение по умолчанию
+
+    # Выбираем шаблоны ответов в зависимости от рейтинга
     responses = {
         5: [
-            f"Здравствуйте! Спасибо за Вашу высокую оценку {our_word_genitive} {first_word_genitive}! Мы рады, что Вам понравился наш товар. Будем рады видеть Вас снова в нашем магазине. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда {brand_name}.",
-            f"Здравствуйте! Благодарим Вас за отличную оценку {our_word_genitive} {first_word_genitive}! Надеемся, что товар полностью оправдал Ваши ожидания. Будем рады видеть Вас снова в нашем магазине. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда {brand_name}.",
-            f"Здравствуйте! Спасибо за Вашу высокую оценку {our_word_genitive} {first_word_genitive}! Мы рады, что Вам понравился наш товар. Будем рады видеть Вас снова в нашем магазине. Добавляйте бренд {brand_name} в избранное, чтобы всегда быть в курсе акций и новинок! С уважением, Команда {brand_name}."
+            f"Здравствуйте!Благодарим вас за позитивный отзыв! Надеемся и дальше видеть вас в числе постоянных покупателей Торговой Марки {brand_name}! Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! C уважением, команда {brand_name}.",
+            f"Здравствуйте!Спасибо, что выбрали нас и оценили качество нашей продукции. Благодарим за покупку! Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! C уважением, команда {brand_name}.",
+            f"Здравствуйте!Благодарим Вас за  отзыв! Мы рады, что вам все понравилось! Желаем приятных покупок. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! C уважением, команда {brand_name}.",
+            f"Здравствуйте!Спасибо за ваш прекрасный отзыв! Мы очень рады, что наш товар Вам понравился и оставил такое приятное впечатление. Желаем приятных покупок! Будем рады видеть Вас в числе наших постоянных покупателей. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! C уважением, команда {brand_name}.",
+            f"Здравствуйте!Благодарим за то, что нашли время, чтобы оценить наш товар и написать отзыв. Будем рады видеть Вас в числе наших постоянных покупателей. Желаем приятных покупок. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! C уважением, команда {brand_name}.",
+            f"Здравствуйте! Спасибо за выбор нашего товара. Нам очень приятно, что Вы по достоинству оценили качество нашей продукции. Благодарим за покупку! Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! C уважением, команда {brand_name}."
         ],
         4: [
-            f"Здравствуйте! Спасибо за Вашу оценку {our_word_genitive} {first_word_genitive}! Мы рады, что товар Вам подошел. Будем рады видеть Вас снова в нашем магазине. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда {brand_name}.",
-            f"Здравствуйте! Благодарим Вас за хорошую оценку {our_word_genitive} {first_word_genitive}! Мы будем рады помочь Вам с выбором в будущем. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда {brand_name}.",
-            f"Здравствуйте! Спасибо за оценку {our_word_genitive} {first_word_genitive}! Если будут предложения, будем рады их услышать. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда {brand_name}."
+            f"Здравствуйте! Благодарим за Ваш отзыв! Ваше мнение действительно важно для нас и помогает в совершенствовании наших услуг. Мы работаем над тем, чтобы каждый Ваш визит был удачным. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда {brand_name}.",
+            f"Здравствуйте! Спасибо за Вашу честную обратную связь. Для нас ценно знать, что Вы оценили наш сервис. Мы стремимся не только поддерживать, но и превосходить Ваши ожидания, поэтому будем признательны за любые рекомендации, которые помогут нам улучшиться. Желаем Вам приятных и удачных покупок. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, команда {brand_name}",
         ],
         3: [
-            f"Здравствуйте! Спасибо за Вашу оценку {our_word_genitive} {first_word_genitive}! Нам важно Ваше мнение, и мы работаем над улучшениями. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда {brand_name}.",
-            f"Здравствуйте! Благодарим Вас за оценку {our_word_genitive} {first_word_genitive}! Мы постараемся улучшить качество товара в будущем. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда {brand_name}.",
-            f"Здравствуйте! Спасибо за Вашу оценку {our_word_genitive} {first_word_genitive}! Мы ценим Вашу обратную связь и будем учитывать Ваши пожелания. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда {brand_name}."
+            f"Здравствуйте! Благодарим за отзыв. Извините за доставленные неудобства. Ваши замечания — ценный вклад в наше стремление к совершенству, и мы сделаем все возможное, чтобы избежать подобных ситуаций в будущем. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда{brand_name}.",
+            f"Здравствуйте! Спасибо за ваше мнение. Нам жаль, что не всё прошло гладко. Ваше доверие — это наша главная ценность, и мы уже рассматриваем все возможности для улучшения на основе Ваших замечаний. Мы надеемся, что будущие взаимодействия будут удовлетворять Вас на все 100%. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, команда {brand_name}",
         ],
         2: [
-            f"Здравствуйте! Благодарим Вас за оценку {our_word_genitive} {first_word_genitive}! Нам жаль, что товар Вам не подошел, мы примем меры. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда {brand_name}.",
-            f"Здравствуйте! Спасибо за оценку {our_word_genitive} {first_word_genitive}. Мы постараемся улучшить качество нашего товара. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда {brand_name}.",
-            f"Здравствуйте! Простите за неудобства с {our_word_genitive} {first_word_genitive}! Мы работаем над улучшением качества товара. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда {brand_name}."
+            f"Здравствуйте! Благодарим за отзыв и приносим извинения за неудобства, с которыми Вы столкнулись. Ваша обратная связь позволяет нам улучшать наши услуги, и мы будем рады предоставить Вам лучший опыт в будущем. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда {brand_name}.",
+            f"Здравствуйте! Спасибо за ваш отзыв. Мы искренне извиняемся за все неудобства, которые могли возникнуть. Ваше мнение крайне важно для нас, и мы уверены, что с вашей помощью сможем выявить и устранить причины произошедшего. Ваш комфорт и удовлетворённость — наш приоритет. С уважением, команда {brand_name}",
         ],
-        1: [
-            f"Здравствуйте! Очень жаль, что Вам не понравилась {our_word_genitive} {first_word_genitive}. Мы примем все меры для улучшения. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда {brand_name}.",
-            f"Здравствуйте! Извините за неприятный опыт с {our_word_genitive} {first_word_genitive}. Мы обязательно учтем Ваши замечания. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда {brand_name}.",
-            f"Здравствуйте! Приносим извинения за негативный опыт с {our_word_genitive} {first_word_genitive}. Мы будем работать над улучшением качества товара. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда {brand_name}."
-        ]
+        1: [  # Особое внимание для рейтинга 1
+            f"Здравствуйте! Спасибо за Ваш отзыв. Нам жаль, что у Вас остались негативные впечатления. Мы внимательно рассмотрим Ваши комментарии, чтобы улучшить качество и предоставить Вам лучший опыт в будущем. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением, Команда.{brand_name}.",
+            f"Здравствуйте! Приносим извинения за доставленные неудобства и благодарим за Ваши замечания. Мы стремимся к высочайшему уровню обслуживания и надеемся, что Вы дадите нам шанс на исправление. Добавляйте бренд {brand_name} в список любимых, чтобы быть в курсе акций и новинок! С уважением и наилучшими пожеланиями, команда {brand_name}."
+
+        ],
     }
+
+    # Берем случайный ответ из шаблонного списка
     return random.choice(responses.get(rating, ["Спасибо за Вашу оценку!"]))
+
+
+async def get_unprocessed_reviews_count(session: aiohttp.ClientSession) -> int:
+    url = f"{OZON_API_URL}/v1/review/list"
+    headers = {
+        "Client-Id": CLIENT_ID,
+        "Api-Key": OZON_TOKEN,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "limit": 20,  # Минимально допустимое значение
+        "status": "UNPROCESSED",
+    }
+
+    try:
+        async with session.post(url, json=payload, headers=headers) as response:
+            result = await response.json()
+            logging.info(f"Полный ответ от API для подсчета отзывов: {result}")  # Логируем полный ответ
+            if response.status == 200:
+                total_reviews = result.get("total", 0)  # Поле для общего количества
+                logging.info(f"Общее количество необработанных отзывов: {total_reviews}")
+                return int(total_reviews)
+            else:
+                logging.error(f"Ошибка при запросе количества отзывов: {result}")
+    except aiohttp.ClientError as e:
+        logging.error(f"Ошибка сети при запросе количества отзывов: {e}")
+    return 0
+
 
 async def handle_reviews(session: aiohttp.ClientSession) -> None:
     """Основной процесс обработки отзывов."""
     logging.info("⏳ Проверка новых отзывов...")
-    reviews = await get_unprocessed_reviews(session)
-    if not reviews:
-        logging.info("Нет новых необработанных отзывов.")
+
+    # Получаем общее количество необработанных отзывов
+    try:
+        total_unprocessed_reviews = await get_unprocessed_reviews_count(session)
+    except Exception as e:
+        logging.error(f"Ошибка при получении количества необработанных отзывов: {e}")
         return
 
-    for review in islice(reviews, 5):  # Обработка первых 5 отзывов
+    # Уведомляем в канал, если есть необработанные отзывы
+    if total_unprocessed_reviews > 0:
+        message = f"📋 На платформе Ozon есть <b>{total_unprocessed_reviews}</b> необработанных отзывов."
+        await notify_users(message)
+
+    # Получаем сами необработанные отзывы
+    reviews = await get_unprocessed_reviews(session)
+    if not reviews:
+        logging.info("Нет новых отзывов для обработки.")
+        return
+
+    for review in islice(reviews, 5):  # Обрабатываем первые 5 отзывов
         review_id = review.get("id")
 
         # Проверяем, был ли отзыв уже обработан
@@ -321,18 +469,14 @@ async def handle_reviews(session: aiohttp.ClientSession) -> None:
         comment_id = await post_comment(review_id, response_text, session)
         if comment_id:
             logging.info(f"Комментарий отправлен для отзыва ID: {review_id}")
-            await notify_channel(sku, response_text, rating, product_name, 'Аноним', review_text)
+            await notify_channel(sku, response_text, rating, product_name, "Аноним", review_text)
 
             # Сохраняем отзыв в базу данных как обработанный
-            save_review_to_db(review_id, str(sku), product_name, 'Аноним', review_text, int(rating), response_text, str(comment_id))
+            save_review_to_db(review_id, str(sku), product_name, "Аноним", review_text, int(rating), response_text, str(comment_id))
         else:
             logging.error(f"Не удалось отправить комментарий для отзыва ID: {review_id}")
 
 
-@router.message(Command(commands=["start", "help"]))
-async def send_welcome(message: Message) -> None:
-    """Обработчик команды /start и /help."""
-    await message.answer("Привет! Этот бот автоматически отвечает на отзывы Ozon.")
 async def scheduled_task(session: aiohttp.ClientSession) -> None:
     """Планировщик обработки отзывов (обрабатывает 5 отзывов каждые 5 минут)."""
     while True:
@@ -342,6 +486,7 @@ async def scheduled_task(session: aiohttp.ClientSession) -> None:
             logging.error(f"Ошибка при обработке отзывов: {e}")
         await asyncio.sleep(CHECK_INTERVAL)
 
+
 async def main() -> None:
     init_db()
     async with aiohttp.ClientSession() as session:
@@ -350,8 +495,8 @@ async def main() -> None:
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
 
+
 if __name__ == "__main__":
     asyncio.run(main())
-
 
 
